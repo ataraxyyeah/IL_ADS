@@ -2,7 +2,10 @@
 # Warning: The scripted policies may generate failure trajectories. You can write a task-dependent criterion to filter the generated trajectories.
 
 import sys
-sys.path.append("../IL")
+import os
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'IL'))
+from contact_force.contact import ContactReader, ROBOT_BODIES
 import metaworld
 import random
 import metaworld.policies as policies
@@ -15,8 +18,11 @@ from collections import deque
 
 from video import VideoRecorder
 
-env_names = ["hammer-v2"]
-num_demos = 10
+env_names = [os.environ.get('ADS_ENV_NAME', 'soccer-v2')]
+num_demos = int(os.environ.get('ADS_NUM_DEMOS', '10'))
+target_body = os.environ.get('ADS_FORCE_TARGET_BODY', 'soccer_ball')
+force_slots = int(os.environ.get('ADS_FORCE_SLOTS', '4'))
+force_threshold = float(os.environ.get('ADS_FORCE_THRESHOLD', '0.01'))
 
 POLICY = {
 	'hammer-v2': policies.SawyerHammerV2Policy,
@@ -121,7 +127,7 @@ for env_name in env_names:
 	# Initialize env
 	mt1 = metaworld.MT1(env_name) # Construct the benchmark, sampling tasks
 	# ml1 = metaworld.ML1(env_name)
-	env = mt1.train_classes[env_name]()  # Create an environment with task `pick_place`
+	env = mt1.train_classes[env_name]()  # Create an environment with task
 
 	# Initialize save dir
 	save_dir = Path("./expert_demos") / env_name
@@ -135,6 +141,8 @@ for env_name in env_names:
 	observations_list = list()
 	actions_list = list()
 	rewards_list = list()
+	forces_list = list()
+	contacts_list = list()
 
 	count = 0
 	episode = 0
@@ -146,21 +154,35 @@ for env_name in env_names:
 		observations = list()
 		actions = list()
 		rewards = list()
+		forces = list()
+		contacts = list()
 		image_stack = deque([], maxlen=3)
 		large_image_stack = deque([], maxlen=3)
 		goal_achieved = 0
 
 		# Set random goal
-		task = mt1.train_tasks[count] #random.choice(ml1.train_tasks)
+		task = mt1.train_tasks[count % len(mt1.train_tasks)]
 		print(count)
 		count += 1
+		if count > max(200, 100 * num_demos):
+			raise RuntimeError('Too many failed or contact-free demos; check task and target body')
 		env.set_task(task)  # Set task
 
 		# Reset env
 		observation = env.reset()  # Reset environment
+		force_reader = ContactReader(env.sim, target_body, force_threshold, force_slots)
 		# video_recorder.record(env)
 		num_steps = NUM_STEPS[env_name]
 		for step in range(num_steps):
+			# Get action
+			action = policy.get_action(observation)
+			action = np.clip(action, -1.0, 1.0)
+			actions.append(action)
+			# Get observation
+			observation[-3:] = 0
+			observations.append(observation)
+			# Act in the environment
+			observation, reward, done, info = env.step(action)
 			# Get frames
 			pixel = env.render(offscreen=True, camera_name=CAMERA[env_name])
 			frame = cv2.resize(pixel.copy(), (84,84))
@@ -175,22 +197,16 @@ for env_name in env_names:
 			while(len(large_image_stack)<3):
 				large_image_stack.append(large_frame)
 			large_images.append(np.concatenate(large_image_stack, axis=0))
-			# Get action
-			action = policy.get_action(observation)
-			action = np.clip(action, -1.0, 1.0)
-			actions.append(action)
-			# Get observation
-			observation[-3:] = 0
-			observations.append(observation)
-			# Act in the environment
-			observation, reward, done, info = env.step(action)
+			force, contact = force_reader.read()
+			forces.append(force)
+			contacts.append(contact)
 			rewards.append(reward)
 			video_recorder.record(env)
 			goal_achieved += info['success'] 
 
 		print(rewards[-1], np.max(rewards))
 		# You can write a task-dependent criterion to filter the generated trajectories!!!
-		if np.max(rewards) < 10:
+		if np.max(rewards) < 10 or not any(contacts):
 			continue
 		# Store trajectory
 		episode = episode + 1
@@ -199,6 +215,8 @@ for env_name in env_names:
 		observations_list.append(np.array(observations))
 		actions_list.append(np.array(actions))
 		rewards_list.append(np.array(rewards))
+		forces_list.append(np.array(forces, dtype=np.float32))
+		contacts_list.append(np.array(contacts, dtype=bool))
 
 		video_recorder.save(f'demo{episode}.mp4')
 
@@ -209,3 +227,13 @@ for env_name in env_names:
 	with open(str(file_path), 'wb') as f:
 		pickle.dump(payload, f)
 
+
+	force_payload = {
+		'metadata': {'target_body': target_body, 'slots': force_slots,
+			'threshold': force_threshold, 'robot_bodies': ROBOT_BODIES,
+			'alignment': 'post_step_v1'},
+		'forces': forces_list, 'contacts': contacts_list,
+	}
+	with open(str(save_dir / 'expert_forces.pkl'), 'wb') as f:
+		pickle.dump(force_payload, f)
+	print('Saved force data:', save_dir / 'expert_forces.pkl')
