@@ -21,6 +21,8 @@ import pickle
 import matplotlib.pyplot as plt
 import seaborn as sns
 from modules.cost_encoder import get_cost_encoder
+from contact_force.contact import ContactReader, ROBOT_BODIES
+from contact_force.staged_ot import StagedOT, sample_post_repeat
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 torch.backends.cudnn.benchmark = True
@@ -53,6 +55,20 @@ class WorkspaceIL:
 			self.cfg.ads.horizon = self.env_horizon
 			self.ads = hydra.utils.instantiate(self.cfg.ads)
 
+		if cfg.staged_force_ot:
+			if cfg.suite.name != 'metaworld' or cfg.obs_type != 'pixels' or repr(self.agent) != 'ot':
+				raise ValueError('staged_force_ot requires suite=metaworld, agent=ot, obs_type=pixels')
+			self.force_reader = ContactReader(self.train_env.sim, cfg.force_target_body,
+				cfg.force_contact_threshold, cfg.force_slots)
+			with open(cfg.expert_force_dataset, 'rb') as f:
+				force_data = pickle.load(f)
+			expected = {'target_body': cfg.force_target_body, 'slots': cfg.force_slots,
+				'threshold': cfg.force_contact_threshold, 'robot_bodies': ROBOT_BODIES,
+				'alignment': 'post_step_v1'}
+			if force_data.get('metadata') != expected:
+				raise ValueError(f'Force dataset metadata mismatch. Expected {expected}, got {force_data.get("metadata")}')
+			if len(force_data['forces']) < cfg.num_demos:
+				raise ValueError('Not enough force demonstrations')
 		self.expert_replay_loader = make_expert_replay_loader(
 			self.cfg.expert_dataset, self.cfg.expert_batch_size, self.cfg.num_demos, self.cfg.obs_type)
 		self.expert_replay_iter = iter(self.expert_replay_loader)
@@ -75,12 +91,20 @@ class WorkspaceIL:
 
 		if self.cfg.obs_type == 'pixels':
 			for i in range(len(self.expert_pixel)):
-				self.expert_pixel[i] = self.expert_pixel[i][::self.cfg.suite.action_repeat]
+				if self.cfg.staged_force_ot:
+					self.expert_pixel[i] = sample_post_repeat(self.expert_pixel[i], self.cfg.suite.action_repeat)
+				else:
+					self.expert_pixel[i] = self.expert_pixel[i][::self.cfg.suite.action_repeat]
 			cost_encoder = get_cost_encoder(self.cfg.cost_encoder, self.cfg.device)
 			with torch.no_grad():
 				demos = [cost_encoder(torch.tensor(demo).to(self.device)) for demo in self.expert_pixel]
 			if repr(self.agent) == 'ot':
 				self.agent.init_demos(demos, cost_encoder)
+				if self.cfg.staged_force_ot:
+					r = self.cfg.suite.action_repeat
+					forces = [sample_post_repeat(x, r) for x in force_data['forces'][:self.cfg.num_demos]]
+					flags = [sample_post_repeat(x, r) for x in force_data['contacts'][:self.cfg.num_demos]]
+					self.staged_ot = StagedOT(self.agent, forces, flags, self.cfg.force_scale)
 			if self.cfg.adaptive_discount:
 				self.ads.init_demos(demos, 'pixels', cost_encoder)
 		else:
@@ -158,9 +182,13 @@ class WorkspaceIL:
 			while not time_step.last():
 				with torch.no_grad(), utils.eval_mode(self.agent):
 					action = self.agent.act(time_step.observation[self.cfg.obs_type], self.global_step, eval_mode=True)
-				observations.append(time_step.observation[self.cfg.obs_type])
-				pixels.append(time_step.observation['pixels_large'])
+				if not self.cfg.staged_force_ot:
+					observations.append(time_step.observation[self.cfg.obs_type])
+					pixels.append(time_step.observation['pixels_large'])
 				time_step = self.eval_env.step(action)
+				if self.cfg.staged_force_ot:
+					observations.append(time_step.observation[self.cfg.obs_type])
+					pixels.append(time_step.observation['pixels_large'])
 				if self.cfg.suite.name == 'metaworld':
 					path.append(time_step.observation['goal_achieved'])
 				self.video_recorder.record(self.eval_env)
@@ -220,6 +248,7 @@ class WorkspaceIL:
 		observations = list()
 		pixels = list()
 		actions = list()
+		forces, contact_flags = [], []
 
 		time_step = self.train_env.reset()
 		time_steps.append(time_step)
@@ -245,7 +274,11 @@ class WorkspaceIL:
 					reward_obs = pixels
 				actions = np.stack(actions, 0)
 				if repr(self.agent) == 'ot':
-					new_rewards = self.agent.ot_rewarder(reward_obs, self.global_step)
+					if self.cfg.staged_force_ot:
+						new_rewards, boundary = self.staged_ot.reward(reward_obs, forces, contact_flags)
+						print(f'[force-ot] episode={self.global_episode} first_contact={boundary}/{len(forces)}')
+					else:
+						new_rewards = self.agent.ot_rewarder(reward_obs, self.global_step)
 					new_rewards_sum = np.sum(new_rewards)
 				elif repr(self.agent) == 'gaifo':
 					new_rewards = self.agent.gaifo_rewarder(observations, actions)
@@ -254,8 +287,11 @@ class WorkspaceIL:
 				if repr(self.agent) == 'ot':
 					if self.agent.auto_rew_scale: 
 						if self._global_episode == 1:
-							self.agent.sinkhorn_rew_scale = self.agent.sinkhorn_rew_scale * self.agent.auto_rew_scale_factor / float(np.abs(new_rewards_sum))
-							new_rewards = self.agent.ot_rewarder(reward_obs, self.global_step)
+							self.agent.sinkhorn_rew_scale = self.agent.sinkhorn_rew_scale * self.agent.auto_rew_scale_factor / max(float(np.abs(new_rewards_sum)), 1e-8)
+							if self.cfg.staged_force_ot:
+								new_rewards, _ = self.staged_ot.reward(reward_obs, forces, contact_flags)
+							else:
+								new_rewards = self.agent.ot_rewarder(reward_obs, self.global_step)
 							new_rewards_sum = np.sum(new_rewards)
 
 				for i, elt in enumerate(time_steps):
@@ -289,6 +325,7 @@ class WorkspaceIL:
 				observations = list()
 				pixels = list()
 				actions = list()
+				forces, contact_flags = [], []
 
 				time_step = self.train_env.reset()
 				time_steps.append(time_step)
@@ -322,6 +359,10 @@ class WorkspaceIL:
 			time_steps.append(time_step)
 			observations.append(time_step.observation[self.cfg.obs_type])
 			pixels.append(time_step.observation['pixels_large'])
+			if self.cfg.staged_force_ot:
+				force, contact = self.force_reader.read()
+				forces.append(force)
+				contact_flags.append(contact)
 			actions.append(time_step.action)
 
 			self.train_video_recorder.record(time_step.observation['pixels'])
