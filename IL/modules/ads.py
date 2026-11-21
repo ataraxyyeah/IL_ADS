@@ -24,7 +24,7 @@ class AutomaticDiscountScheduling:
 		scores = []
 		for i in range(len(demos)):
 			for j in range(len(demos)):
-				if j != i:
+				if j != i or len(demos) == 1:
 					demo1 = torch.tensor(demos[i]).to(self.device).float()
 					demo2 = torch.tensor(demos[j]).to(self.device).float()
 					if obs_type == 'pixels':
