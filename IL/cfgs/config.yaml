@@ -38,6 +38,14 @@ expert_dataset: '${root_dir}/IL/expert_demos/${task_name}/expert_demos.pkl'
 load_checkpoint: false
 checkpoint_path: 
 
+# Two-stage force-aware OT (only supported with agent=ot and obs_type=pixels)
+staged_force_ot: false
+force_target_body: soccer_ball
+force_slots: 4
+force_contact_threshold: 0.01
+force_scale: 1.0
+expert_force_dataset: '${root_dir}/IL/expert_demos/${task_name}/expert_forces.pkl'
+
 # Automatic Discount Scheduling
 adaptive_discount: false
 cost_encoder: 'resnet'
